@@ -1,0 +1,217 @@
+---
+  - name: Deploy Terraform Project
+    connection: local
+    hosts: localhost
+    gather_facts: True
+
+    vars:
+      ws: "{{ workspace | ternary('environment=' + workspace + ' ','staging ') }}"
+      bk: "{{ backend | default('local') }}"
+      ws_option: "{{ (workspace == 'prod') | ternary(2,3) }}"
+      az: "{{ (availability_zone is defined) | ternary('availability_zone=' + availability_zone + ' ',' ') }}"
+
+    tasks:
+    - name: "Describe Playbook: Extra Variables"
+      set_fact:
+        dummy_var: "Variable '{{ item.name }}' is '{{ item.use }}'; default value = '{{ item.default }}'"
+      with_items:
+        - { name: "backend", use: "MANDATORY", default: "local" }
+        - { name: "workspace", use: "MANDATORY", default: "staging" }
+        - { name: "availability_zone", use: "MANDATORY", default: "us-east-1" }
+      tags: discovery
+
+
+
+### Validate Input ###
+    - name: "Ansible: Validate Workspace Input"
+      assert:
+        that: 
+          - "backend == 's3' or backend == 'local'"
+          - "workspace == 'prod' or workspace == 'staging'"
+          - "availability_zone == 'us-east-1' or availability_zone == 'us-east-2' or availability_zone == 'us-west-1' or availability_zone == 'us-west-2'"
+        success_msg: "Variable validations successfull"
+      tags: plan_only, plan_apply, apply_only
+
+### Update backend in main.tf ###
+    - name: "Update bk in main.tf"
+      blockinfile:
+        path: "main.tf"
+        marker: "### {mark} Ansible Block: Backend ###"
+        insertafter: BOF
+        marker_begin: "BEGIN"
+        marker_end: "END"
+        content: |
+          {% if (ws == 'staging') and (bk == 's3') %}
+          terraform {
+            backend "s3" {
+              bucket = "mauricew-f7"
+              key = "main.tfstate"
+              workspace_key_prefix = "workspaces"
+              region = "us-east-1"
+              encrypt = "true"
+            }
+          }
+          {% elif (ws == 'prod') and (bk == 's3') %}
+          terraform {
+            backend "s3" {
+              bucket = "mauricew-f7"
+              key = "main.tfstate"
+              workspace_key_prefix = "workspaces"
+              region = "us-east-1"
+              encrypt = "true"
+            }
+          }
+          {% else %}
+          terraform {
+            backend "local" {
+              path = "main.tfstate"
+            }
+          }
+          {% endif %}
+      tags: plan_only, plan_apply, apply_only
+
+### BEGIN Plan Only ###
+    - name: "Terraform: Remove Old Plan if Exists"
+      shell: "rm *.tfplan"
+      check_mode: no
+      register: result
+      failed_when: result.rc >= 2
+      tags: plan_only
+
+    - name: "Terraform: Plan Only"
+      terraform:
+        workspace: "{{ workspace }}"
+        force_init: yes
+        project_path: "./"
+        variables: "{{ ws }} {{ az }}"
+      register: plan_only
+      check_mode: yes
+      tags: plan_only
+      ignore_errors: true
+
+    - name: "Terraform: Plan Only - [exception handler (1/2)]"
+      shell: |
+        printf -- 'yes\n{{ ws_option }}\n' | terraform init &> /dev/null
+      register: plan_only1
+      when: plan_only.failed == true
+      tags: plan_only
+
+    - name: "Terraform: Plan Only - [exception handler (2/2)]"
+      terraform:
+        workspace: "{{ workspace }}"
+        force_init: yes
+        project_path: "./"
+      register: plan_only1
+      check_mode: yes
+      when: plan_only.failed == true
+      tags: plan_only
+
+    - name: "Terraform: Get Generated Plan"
+      set_fact:
+        plan: "{{ plan_only.command.split() | last }}"
+      when: plan_only.failed == false
+      tags: plan_only
+
+    - name: "Terraform: Get Generated Plan"
+      set_fact:
+        plan: "{{ plan_only1.command.split() | last }}"
+      when: plan_only.failed == true
+      tags: plan_only
+
+    - name: "Terraform: Save Generated Plan in Current Directory"
+      command: "mv {{ plan }} ./ "
+      when: plan is defined
+      check_mode: no
+      tags: plan_only
+
+    - name: "Terraform: Display Plan to Console (1/2)"
+      shell: "awk -F / '{print $NF}' <<<{{ plan }} | terraform plan "
+      register: output
+      tags: plan_only
+
+    - name: "Terraform: Display Plan to Console (1/2)"
+      debug:
+        msg: "{{ output }}"
+      tags: plan_only
+### END Plan Only ###
+
+### BEGIN Plan and Apply ###
+    - name: "Terraform: Plan and Apply"
+      terraform:
+        workspace: "{{ workspace }}"
+        force_init: yes
+        project_path: "./"
+        variables: "{{ ws }} {{ az }}"
+      register: plan_apply
+      tags: plan_apply
+      ignore_errors: true
+
+    - name: "Terraform: Plan and Apply - [exception handler (1/2)]"
+      shell: |
+        printf -- 'yes\n{{ ws_option }}\n' | terraform init &> /dev/null
+      register: plan_apply1
+      when: plan_apply.failed == true
+      tags: plan_apply
+
+    - name: "Terraform: Plan and Apply - [exception handler (2/2)]"
+      terraform:
+        workspace: "{{ workspace }}"
+        force_init: yes
+        project_path: "./"
+        variables: "{{ ws }} {{ az }}"
+      register: plan_apply1
+      when: plan_apply.failed == true
+      tags: plan_apply
+
+    - debug: var=plan_apply
+      tags: plan_apply
+### END Plan and Apply ###
+
+### BEGIN Apply Only ###
+    - name: "Terraform: Locate Most Recent Plan"
+      find:
+        paths: "."
+        file_type: file
+        patterns: '*.tfplan'
+        recurse: false
+      check_mode: no
+      register: prev_plan_file
+      ignore_errors: false
+      tags: apply_only
+      
+    - name: "Terraform: Register *.tfplan Info"
+      set_fact:
+         prev_plan: "{{ prev_plan_file.files | sort(attribute='mtime',reverse=true) | first }}"
+      tags: apply_only
+      check_mode: no
+
+    - name: "Terraform: Apply Most Recent Plan"
+      terraform:
+        workspace: "{{ workspace }}"
+        force_init: yes
+        project_path: "./"
+        plan_file: "{{ prev_plan.path }}" 
+        variables: "{{ ws }} {{ az }}"
+      register: apply_only
+      when: prev_plan.path is defined
+      tags: apply_only
+
+    - name: "Terraform: Apply Only - [exception handler (1/2)]"
+      shell: |
+        printf -- 'yes\n{{ ws_option }}\n' | terraform init &> /dev/null
+      register: apply_only1
+      when: apply_only.failed == true
+      tags: apply_only
+
+    - name: "Terraform: Apply Only - [exception handler (2/2)]"
+      terraform:
+        workspace: "{{ workspace }}"
+        force_init: yes
+        project_path: "./"
+        plan_file: "{{ prev_plan.path }}"
+        variables: "{{ ws }} {{ az }}"
+      register: apply_only1
+      when: prev_plan.path is defined and apply_only.failed == true
+      tags: apply_only
+
+### END Apply Only ###
