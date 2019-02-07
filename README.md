@@ -19,6 +19,6 @@
 
     - Ansible: Terraform module is limited:
         - no option to save generated plans in an alternate path
-        - "-input=false" disables interactive prompts to perform state migrations or select workspaces
+        - "-input=false" disables interactive prompts to perform state migrations
         - "terraform plan" must be run using ansible's "--check" mode or option "check_mode: no" vs explicit 'plan mode'
 
